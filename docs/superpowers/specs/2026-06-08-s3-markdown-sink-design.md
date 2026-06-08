@@ -19,15 +19,19 @@ auto-embedded `body` **vector** column (OpenAI `text-embedding-3-small`), querie
 `semanticSearch` from `tools/kb-search.ts`. **Vertex is not in this path at all.** It is
 populated today by `scripts/kb_ingest.py`, run by hand against a local JSON export.
 
-**Goal of this work:** add a "dumb" wurzel sink that writes the scraped KB as raw JSON to an
-S3 bucket, so the new custom-table ingest can consume it — running **alongside** the legacy
-`WonderfulRAGStep`, not replacing it. This enables a true A/B experiment: same scraped source,
-two indexes (legacy Vertex KB vs. new custom-table vector RAG), compared on retrieval quality.
+**Goal of this work:** add a "dumb" wurzel sink that writes the scraped KB as **one raw JSON
+file** to an S3 bucket, so the new custom-table ingest can consume it — and **delete
+`WonderfulRAGStep`** (the legacy Wonderful-KB/Vertex sink). S3 becomes the sole sink; the
+Vertex re-index path is removed.
+
+> **Note on the deployed legacy path:** `WonderfulRAGStep` was never committed to this repo's
+> `main` (purely local work), so deleting it here is clean. But whatever currently updates the
+> Wonderful KB in DT's deployment doesn't run from `main` either — removing these files does
+> **not** by itself stop the live legacy/Vertex path; that deployment must be cut over separately.
 
 **Explicitly NOT in scope here** (owned by Noa / later decisions):
 - The S3 → custom-table ingestion (reuses `kb_ingest.py`, scheduled in `wonderful-global`).
-- Retiring `WonderfulRAGStep` / removing Vertex — that's a future cutover once the experiment
-  picks a winner.
+- Cutting over DT's live deployment off the legacy KB path (see note above).
 - Migrating tenants other than DT-CZ.
 
 ---
@@ -37,45 +41,57 @@ two indexes (legacy Vertex KB vs. new custom-table vector RAG), compared on retr
 ```
 ──────── DT infra (telekom k8s) ─────────          ──────── wonderful-global (Noa) ────────
  wurzel CronJob (per tenant)
-   source → … → S3MarkdownSink ──┐
-                                 ▼
-   WonderfulRAGStep ──► Wonderful KB     S3: wonderful-dtcz-kb ──► kb_ingest.py (scheduled,
-       (legacy, Vertex re-index)         dt-cz/<ts>.json              single-concurrency)
-                                         dt-cz/latest.json     ──►  POST custom-tables/
-                                                                     kb_<cat>/rows/bulk
-                                                                     (OpenAI auto-embed)
+   source → … → S3MarkdownSink ──►  S3: wonderful-dtcz-kb ──► kb_ingest.py (scheduled,
+                                    dt-cz/<ts>.json              single-concurrency)
+                                    dt-cz/latest.json     ──►  POST custom-tables/
+                                                                kb_<cat>/rows/bulk
+                                                                (OpenAI auto-embed)
 ```
 
+- **S3 is the sole sink.** `WonderfulRAGStep` (legacy Wonderful-KB / Vertex re-index) is deleted.
 - **The S3 bucket is the contract** between this repo and Noa's ingest. wurzel writes;
   the ingest reads `latest.json`. Neither side imports the other's code.
-- **Additive only.** Nothing existing is removed; today's pipeline keeps working untouched.
 
 ---
 
 ## 3. The step — `S3MarkdownSink`
 
-New package `wurzel/steps/s3/` (`__init__.py`, `settings.py`, `step.py`), structurally
-mirroring `wurzel/steps/wonderful/` but much simpler — no Wonderful API, no sync, no Vertex.
+New package `wurzel/steps/s3/` (`__init__.py`, `settings.py`, `step.py`) — a minimal sink:
+no Wonderful API, no sync, no Vertex. Just serialize and PUT.
 
 **Type:** `TypedStep[S3MarkdownSinkSettings, list[MarkdownDataContract], list[MarkdownDataContract]]`
-— a **passthrough sink**: returns its input unchanged so it can chain (same pattern as
-`WonderfulRAGStep`).
+— a **passthrough sink**: returns its input unchanged so it can chain.
 
 **Behaviour (`run`):**
-1. If `SKIP` → log and return input unchanged (no S3 call, no creds required). Mirrors
-   `WonderfulRAGStep`'s no-op mode for per-env toggling.
-2. Serialize: `payload = [doc.model_dump() for doc in inpt]` → `json.dumps(payload, ensure_ascii=False)`.
+1. If `SKIP` → log and return input unchanged (no S3 call, no creds required).
+2. Serialize the **whole list to ONE JSON array** (not per-record `.md` files):
+   `body = json.dumps([doc.model_dump() for doc in inpt], ensure_ascii=False)`.
    `MarkdownDataContract` is `{md, keywords, url, metadata}` (wurzel/datacontract/common.py),
-   which is **exactly** the `[{md, keywords, url, metadata}]` shape `kb_ingest.py` already reads —
-   no transformation.
-3. PUT the body to `s3://<BUCKET>/<PREFIX>/<ts>.json` where `ts` is a UTC ISO-ish timestamp
-   (e.g. `2026-06-08T155900Z`), `ContentType: application/json`.
-4. PUT the **same body** to `s3://<BUCKET>/<PREFIX>/latest.json` (stable pointer the ingest reads).
-   Bucket versioning is enabled, so `latest.json` keeps its own history too.
+   so the array is **byte-for-byte** the `[{md, keywords, url, metadata}, ...]` shape of the
+   existing `KnowledgeBaseApiGather-…json` that `kb_ingest.py` already reads — no transformation,
+   `metadata` preserved verbatim as a passthrough dict.
+3. PUT the body to `s3://<BUCKET>/<PREFIX>/<ts>.json` where `ts` is a UTC timestamp
+   (e.g. `2026-06-08T155900Z`), `ContentType: application/json`, **plus `x-amz-meta-*`
+   provenance** (see below). This timestamped object is the immutable history snapshot.
+4. PUT the **same body + same metadata** to `s3://<BUCKET>/<PREFIX>/latest.json` (stable pointer
+   the ingest reads). Bucket versioning is enabled, so `latest.json` keeps its own history too.
 5. Return `inpt` unchanged.
 
-**Failure:** raise `StepFailed` on a PUT error (unlike `WonderfulRAGStep`'s per-doc tolerance —
-there's a single object, so a failed write is a hard failure).
+**Per-run provenance — S3 object metadata** (`Metadata={...}` on both PUTs; S3 prefixes them
+`x-amz-meta-` and lowercases the keys, readable via `head-object` without downloading the file):
+
+| Key | Value |
+|---|---|
+| `record-count` | `str(len(inpt))` |
+| `run-ts` | the same `<ts>` UTC timestamp |
+| `tenant` | the configured tenant (`TENANT` setting, default = `PREFIX`) |
+| `source-commit` | optional — a git SHA from env if the pipeline exposes one; omit if absent |
+
+The timestamped filename already encodes "when"; this adds count/tenant/source for cheap
+queryability. All best-effort — a missing optional value is simply omitted, never a hard error.
+
+**Failure:** raise `StepFailed` on a PUT error — there's a single object, so a failed write is
+a hard failure (no partial-success semantics needed).
 
 **Dependency:** `boto3` (or `s3fs`), added as an **optional extra** and gated behind a
 `HAS_BOTO3` flag in `wurzel/steps/s3/__init__.py`, exactly like `paramiko`/`HAS_PARAMIKO`
@@ -92,6 +108,7 @@ Follows the existing `WONDERFULRAGSTEP__` / `SFTPMANUALMARKDOWNSTEP__` conventio
 | `SKIP` | no | `false` | `true` → no-op passthrough; no creds needed (per-env toggle / experiment switch) |
 | `BUCKET` | yes (unless SKIP) | — | `wonderful-dtcz-kb` |
 | `PREFIX` | no | `dt-cz` | key prefix; objects land at `<PREFIX>/<ts>.json` + `<PREFIX>/latest.json` |
+| `TENANT` | no | = `PREFIX` | written as `x-amz-meta-tenant` provenance |
 | `REGION` | no | `eu-central-1` | |
 | `ENDPOINT_URL` | no | `""` | set only for MinIO / localstack tests |
 | AWS creds | — | env / pod role | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` from the IAM user below, or an instance/IRSA role |
@@ -103,26 +120,22 @@ A `model_validator` requires `BUCKET` (and resolvable creds) unless `SKIP=true`,
 
 ## 5. Pipeline wiring
 
+S3 is the sole sink; `WonderfulRAGStep` is deleted (`wurzel/steps/wonderful/` removed).
+
 `local/wonderful_pipeline.py`:
 
 ```python
-source         = WZ(ManualMarkdownStep)   # or the real scraperapi/docling source
-s3_sink        = WZ(S3MarkdownSink)        # NEW
-wonderful_sink = WZ(WonderfulRAGStep)      # KEPT (legacy Vertex path)
-source >> s3_sink >> wonderful_sink        # S3 export runs FIRST
-pipeline = wonderful_sink
+source  = WZ(ManualMarkdownStep)   # or the real scraperapi/docling source
+s3_sink = WZ(S3MarkdownSink)        # NEW — the only sink
+source >> s3_sink
+pipeline = s3_sink
 ```
 
-- **S3 before Wonderful**, because `WonderfulRAGStep` raises `StepFailed` when all docs fail
-  (a KB/Vertex hiccup). Running the S3 export upstream means Noa's data is written **before**
-  any legacy-KB call — a Vertex problem can never block the export the experiment depends on.
-  Both steps are passthrough, so `wonderful_sink` still receives the identical doc list.
-- **The DAG is single-terminal** (DVC/Argo backends recurse upstream from one `pipeline`
-  node over `required_steps`), so two independent sink leaves aren't expressible — chaining
-  the two passthrough sinks is the correct shape, not fan-out.
-- **Experiment toggle, no code change:** flip each path via its `__SKIP` env —
-  both on (dual-write A/B) · `WONDERFULRAGSTEP__SKIP=true` (S3-only, no Vertex) ·
-  `S3MARKDOWNSINKSTEP__SKIP=true` (legacy only, today's behaviour).
+- **Single-terminal DAG** (DVC/Argo backends recurse upstream from one `pipeline` node over
+  `required_steps`) — `pipeline = s3_sink` is the correct shape.
+- **Deletion checklist:** remove `wurzel/steps/wonderful/` (the 3 staged-but-uncommitted files),
+  and scrub any `WonderfulRAGStep` references in the gitignored `local/` (`wonderful_pipeline.py`,
+  `README.md`, the `WONDERFULRAGSTEP__*` lines in the `*.env` files).
 
 ---
 
@@ -146,9 +159,11 @@ gitignored `local/s3-sink.env`.
 
 ## 7. Testing
 
-- Unit-test serialization (`MarkdownDataContract` list → expected JSON array) and the
-  `latest.json` second-PUT, using `moto` (mocked S3) or a stubbed boto3 client — matching the
-  repo's existing test style under `tests/`.
+- Unit-test serialization (`MarkdownDataContract` list → expected single JSON array, `metadata`
+  preserved) using `moto` (mocked S3) or a stubbed boto3 client — matching the repo's existing
+  test style under `tests/`.
+- Both objects written: assert `<ts>.json` **and** `latest.json` exist with identical bodies.
+- Provenance: assert `x-amz-meta-record-count` / `run-ts` / `tenant` are set on both objects.
 - `SKIP=true` → asserts no S3 client is constructed and input passes through unchanged.
 - A PUT error → asserts `StepFailed`.
 - Optional integration check against MinIO via `ENDPOINT_URL` (manual / CI-gated).
