@@ -235,4 +235,5 @@ test_file.py
 #   These files are used for local development and should not be included in version control.
 tmp.py
 tmp/
+local/
 examples/pipeline/output
